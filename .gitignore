@@ -7,6 +7,7 @@ config.yaml
 secrets.enc
 secrets.meta.json
 .vault-key
+.password
 *.pem
 *.key
 .DS_Store

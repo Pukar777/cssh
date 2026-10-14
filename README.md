@@ -7,7 +7,7 @@ Configurable SSH client with encrypted secrets and project-based server selectio
 - **Project / server picker** — run `cssh` and choose where to connect
 - **Direct connect** — `cssh myproject web`
 - **Encrypted vault** — PEM files and private keys stored with AES-256-GCM
-- **OS auth gate** — real `sudo` prompt on Linux/macOS, Windows account password check on Windows
+- **Auth gate** — real `sudo` prompt on Linux/macOS, a `cssh` password on Windows
 - **PEM and key auth** — EC2 PEM pairs or ed25519/RSA private keys
 - **No secrets in repo** — config and vault live in `~/.config/cssh/`
 
@@ -51,6 +51,7 @@ cssh config list      # show all servers
 | `~/.config/cssh/config.yaml` | Projects, servers, auth references |
 | `~/.config/cssh/secrets.enc` | Encrypted vault (all PEM/key material) |
 | `~/.config/cssh/.vault-key` | Local encryption key (mode 600) |
+| `~/.config/cssh/.password` | Windows only: salted scrypt hash of the `cssh` password |
 
 ## Config schema
 
@@ -75,7 +76,7 @@ projects:
 
 ## Authentication
 
-**Windows:** there is no `sudo`, so `cssh` asks for your Windows account password in the terminal and verifies it with the OS (3 attempts). Windows Hello PINs don't work here — use the account password. Requires `powershell.exe` and OpenSSH Client (`ssh.exe`) on PATH.
+**Windows:** Windows 11's built-in `sudo` doesn't support `-k`, and many accounts sign in with a PIN or have no password at all, so `cssh` uses its own password instead. On first run it asks you to create one; after that it asks for it each time (3 attempts). Only a salted scrypt hash is stored, in `~/.config/cssh/.password`. To reset it, delete that file. Requires OpenSSH Client (`ssh.exe`) on PATH.
 
 **Linux/macOS:**
 
@@ -120,7 +121,7 @@ alias web-n='cssh -n myproject web'    # agent/script friendly
 - Vault key at `~/.config/cssh/.vault-key` (mode 600)
 - Non-interactive mode skips sudo — disable with `allow_non_interactive: false`
 - Temp key files written to `/tmp/cssh-*` with mode 0600, deleted on exit
-- **Never commit** `config.yaml`, `secrets.enc`, `.vault-key`, or PEM files
+- **Never commit** `config.yaml`, `secrets.enc`, `.vault-key`, `.password`, or PEM files
 
 ## Commands
 

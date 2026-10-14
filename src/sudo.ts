@@ -1,33 +1,24 @@
 import { spawn } from "node:child_process";
+import { randomBytes, scrypt, timingSafeEqual } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
+import * as p from "@clack/prompts";
+import { CONFIG_DIR, PASSWORD_FILE } from "./paths.js";
 
-const WINDOWS_MAX_ATTEMPTS = 3;
+const scryptAsync = promisify(scrypt) as (
+  password: string,
+  salt: Buffer,
+  keylen: number
+) => Promise<Buffer>;
 
-/**
- * Prompts for the current Windows account password in the terminal and
- * validates it against the OS. The password is read and checked entirely
- * inside PowerShell, so it never passes through Node.
- * Exit code 0 = verified, 1 = failed.
- */
-const WINDOWS_PASSWORD_SCRIPT = `
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.DirectoryServices.AccountManagement
-$isLocal = $env:USERDOMAIN -eq $env:COMPUTERNAME
-$type = if ($isLocal) { [System.DirectoryServices.AccountManagement.ContextType]::Machine } else { [System.DirectoryServices.AccountManagement.ContextType]::Domain }
-$name = if ($isLocal) { $env:COMPUTERNAME } else { $env:USERDOMAIN }
-$ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext($type, $name)
-for ($i = 0; $i -lt ${WINDOWS_MAX_ATTEMPTS}; $i++) {
-  $secure = Read-Host "[cssh] password for $env:USERNAME" -AsSecureString
-  $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-  try {
-    $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-    if ($ctx.ValidateCredentials($env:USERNAME, $plain)) { exit 0 }
-  } finally {
-    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-  }
-  Write-Host "Sorry, try again."
+const MAX_ATTEMPTS = 3;
+const HASH_LENGTH = 64;
+const MIN_PASSWORD_LENGTH = 4;
+
+interface StoredPassword {
+  salt: string;
+  hash: string;
 }
-exit 1
-`;
 
 function run(command: string, args: string[]): Promise<number> {
   return new Promise<number>((resolve, reject) => {
@@ -37,25 +28,76 @@ function run(command: string, args: string[]): Promise<number> {
   });
 }
 
-async function ensureWindowsPasswordAuthenticated(): Promise<void> {
-  const encoded = Buffer.from(WINDOWS_PASSWORD_SCRIPT, "utf16le").toString("base64");
-  const code = await run("powershell.exe", [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-EncodedCommand",
-    encoded,
-  ]);
+async function askPassword(message: string): Promise<string> {
+  const value = await p.password({ message, mask: "*" });
+  if (p.isCancel(value)) {
+    p.cancel("Operation cancelled.");
+    process.exit(0);
+  }
+  return value;
+}
 
-  if (code !== 0) {
-    throw new Error("Windows password authentication failed");
+async function loadStoredPassword(): Promise<StoredPassword | null> {
+  try {
+    return JSON.parse(await readFile(PASSWORD_FILE, "utf8")) as StoredPassword;
+  } catch {
+    return null;
   }
 }
 
-/**
- * Gate access behind the OS's own authentication:
- * real `sudo` on Linux/macOS, a Windows account password check on Windows.
- */
+async function createPassword(): Promise<void> {
+  p.log.info("No cssh password set yet. Create one to protect access.");
+
+  for (;;) {
+    const password = await askPassword("New cssh password");
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      p.log.warn(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+      continue;
+    }
+
+    const confirm = await askPassword("Confirm cssh password");
+    if (password !== confirm) {
+      p.log.warn("Passwords do not match, try again.");
+      continue;
+    }
+
+    const salt = randomBytes(16);
+    const hash = await scryptAsync(password, salt, HASH_LENGTH);
+    const stored: StoredPassword = {
+      salt: salt.toString("hex"),
+      hash: hash.toString("hex"),
+    };
+
+    await mkdir(CONFIG_DIR, { recursive: true });
+    await writeFile(PASSWORD_FILE, JSON.stringify(stored), { mode: 0o600 });
+    p.log.success("cssh password saved.");
+    return;
+  }
+}
+
+async function verifyPassword(stored: StoredPassword): Promise<void> {
+  const salt = Buffer.from(stored.salt, "hex");
+  const expected = Buffer.from(stored.hash, "hex");
+
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const password = await askPassword(`[cssh] password for ${process.env.USERNAME ?? "user"}`);
+    const actual = await scryptAsync(password, salt, expected.length);
+    if (timingSafeEqual(actual, expected)) return;
+    p.log.warn("Sorry, try again.");
+  }
+
+  throw new Error("cssh password authentication failed");
+}
+
+async function ensureWindowsPasswordAuthenticated(): Promise<void> {
+  const stored = await loadStoredPassword();
+  if (!stored) {
+    await createPassword();
+    return;
+  }
+  await verifyPassword(stored);
+}
+
 export async function ensureSudoAuthenticated(): Promise<void> {
   if (process.platform === "win32") {
     await ensureWindowsPasswordAuthenticated();
